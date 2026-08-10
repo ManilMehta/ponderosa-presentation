@@ -1,185 +1,432 @@
-import { useMemo, useState } from "react";
-import { DUP_CLUSTER_IDS, STATS } from "../../content/slides";
+import { useEffect, useMemo, useRef, useState } from "react";
+import * as d3 from "d3";
+import {
+  DUP_IBD2_THRESHOLD,
+  REL_COLOR,
+  REL_LABEL,
+  buildGraph,
+  endpointId,
+  formatCm,
+  formatInt,
+  formatProb,
+  type GraphData,
+  type GraphEdge,
+  type GraphNode,
+  type Rel,
+} from "../../lib/graph";
 
-type Rel = "PO" | "FS" | "AV" | "MHS" | "DUP";
+const TSV_URL = "/SAC_MEGA_real_inference_close_relatives.tsv";
+const WIDTH = 980;
+const HEIGHT = 420;
 
-type Node = {
-  id: string;
-  x: number;
-  y: number;
-  group: "ordinary" | "dup";
-};
-
-type Edge = {
-  source: string;
-  target: string;
-  rel: Rel;
-};
-
-/** Illustrative ordinary close-relative pairs (counts match validated summary; IDs are synthetic labels). */
-function buildOrdinaryNetwork(): { nodes: Node[]; edges: Edge[] } {
-  const nodes: Node[] = [];
-  const edges: Edge[] = [];
-
-  // Compact families that mirror validated PO / FS / 2nd patterns without claiming real SacMEGA IDs.
-  const families = [
-    { prefix: "F1", members: 4, links: [["0", "1", "PO"], ["0", "2", "PO"], ["1", "2", "FS"], ["1", "3", "AV"]] as const },
-    { prefix: "F2", members: 3, links: [["0", "1", "PO"], ["1", "2", "MHS"]] as const },
-    { prefix: "F3", members: 3, links: [["0", "1", "FS"], ["0", "2", "AV"]] as const },
-    { prefix: "F4", members: 2, links: [["0", "1", "PO"]] as const },
-    { prefix: "F5", members: 2, links: [["0", "1", "MHS"]] as const },
-  ];
-
-  families.forEach((family, familyIndex) => {
-    const cx = 170 + (familyIndex % 3) * 195;
-    const cy = 120 + Math.floor(familyIndex / 3) * 200;
-    for (let i = 0; i < family.members; i += 1) {
-      const angle = (i / family.members) * Math.PI * 2 - Math.PI / 2;
-      nodes.push({
-        id: `${family.prefix}_${i}`,
-        x: cx + Math.cos(angle) * 48,
-        y: cy + Math.sin(angle) * 48,
-        group: "ordinary",
-      });
-    }
-    family.links.forEach(([a, b, rel]) => {
-      edges.push({
-        source: `${family.prefix}_${a}`,
-        target: `${family.prefix}_${b}`,
-        rel: rel as Rel,
-      });
-    });
-  });
-
-  return { nodes, edges };
-}
-
-function buildDupCluster(offsetX: number, offsetY: number): { nodes: Node[]; edges: Edge[] } {
-  const n = DUP_CLUSTER_IDS.length;
-  const nodes: Node[] = DUP_CLUSTER_IDS.map((id, index) => {
-    const angle = (index / n) * Math.PI * 2 - Math.PI / 2;
-    return {
-      id,
-      x: offsetX + Math.cos(angle) * 118,
-      y: offsetY + Math.sin(angle) * 118,
-      group: "dup" as const,
-    };
-  });
-
-  // Show a subset of the complete graph so the SVG stays readable (full C(16,2)=120).
-  const edges: Edge[] = [];
-  for (let i = 0; i < n; i += 1) {
-    for (let j = i + 1; j < n; j += 1) {
-      if ((j - i) % 3 === 0 || j === i + 1 || (i === 0 && j === n - 1)) {
-        edges.push({ source: DUP_CLUSTER_IDS[i], target: DUP_CLUSTER_IDS[j], rel: "DUP" });
-      }
-    }
-  }
-
-  return { nodes, edges };
-}
-
-const REL_COLORS: Record<Rel, string> = {
-  PO: "#2f6fed",
-  FS: "#1f9d6a",
-  AV: "#c98512",
-  MHS: "#9b5de5",
-  DUP: "#d64545",
-};
+type Selection =
+  | { kind: "intro" }
+  | { kind: "sample"; node: GraphNode }
+  | { kind: "edge"; edge: GraphEdge };
 
 export function RelationshipGraph() {
-  const [focus, setFocus] = useState<"all" | "ordinary" | "dup">("all");
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
+  const [data, setData] = useState<GraphData>({ nodes: [], edges: [] });
+  const [status, setStatus] = useState("Loading SacMEGA close-relative TSV…");
+  const [hint, setHint] = useState("Hover a sample or relationship line. Click to inspect.");
+  const [activeRels, setActiveRels] = useState<Set<Rel>>(new Set(Object.keys(REL_COLOR) as Rel[]));
+  const [selection, setSelection] = useState<Selection>({ kind: "intro" });
+  const [search, setSearch] = useState("");
 
-  const { nodes, edges } = useMemo(() => {
-    const ordinary = buildOrdinaryNetwork();
-    const dup = buildDupCluster(820, 210);
-    return {
-      nodes: [...ordinary.nodes, ...dup.nodes],
-      edges: [...ordinary.edges, ...dup.edges],
+  const selectedId = selection.kind === "sample" ? selection.node.id : null;
+  const selectedEdge = selection.kind === "edge" ? selection.edge : null;
+
+  const counts = useMemo(() => {
+    const tally: Record<Rel, number> = { PO: 0, FS: 0, AV: 0, MHS: 0, DUP: 0, OTHER: 0 };
+    data.edges.forEach((edge) => {
+      tally[edge.rel] += 1;
+    });
+    return tally;
+  }, [data.edges]);
+
+  useEffect(() => {
+    let cancelled = false;
+    d3.tsv(TSV_URL)
+      .then((rows) => {
+        if (cancelled) return;
+        const graph = buildGraph(rows as unknown as Record<string, string>[], DUP_IBD2_THRESHOLD);
+        setData(graph);
+        setStatus(
+          `Loaded SacMEGA close relatives: ${formatInt(graph.edges.length)} pairs, ${formatInt(graph.nodes.length)} samples.`,
+        );
+      })
+      .catch((error: Error) => {
+        if (cancelled) return;
+        setStatus(`Could not load TSV: ${error.message}`);
+      });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
-  const nodeMap = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  useEffect(() => {
+    const svgEl = svgRef.current;
+    if (!svgEl || data.nodes.length === 0) return;
 
-  const visibleNodes = nodes.filter((node) => focus === "all" || node.group === focus);
-  const visibleIds = new Set(visibleNodes.map((node) => node.id));
-  const visibleEdges = edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
+    const svg = d3.select(svgEl);
+    svg.selectAll("*").remove();
+    svg.attr("viewBox", `0 0 ${WIDTH} ${HEIGHT}`);
+
+    const root = svg.append("g");
+    const linkG = root.append("g");
+    const nodeG = root.append("g");
+    const labelG = root.append("g");
+
+    const zoom = d3
+      .zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.35, 5])
+      .on("zoom", (event) => {
+        root.attr("transform", event.transform.toString());
+      });
+    zoomRef.current = zoom;
+    svg.call(zoom);
+
+    const visibleEdges = data.edges.filter((edge) => activeRels.has(edge.rel));
+    const visibleIds = new Set<string>();
+    visibleEdges.forEach((edge) => {
+      visibleIds.add(endpointId(edge.source));
+      visibleIds.add(endpointId(edge.target));
+    });
+    const visibleNodes = data.nodes.filter((node) => visibleIds.has(node.id));
+
+    const sim = d3
+      .forceSimulation<GraphNode>(visibleNodes)
+      .force(
+        "link",
+        d3
+          .forceLink<GraphNode, GraphEdge>(visibleEdges)
+          .id((node) => node.id)
+          .distance((edge) => (edge.rel === "DUP" ? 30 : 72))
+          .strength(0.55),
+      )
+      .force("charge", d3.forceManyBody().strength(-95))
+      .force("center", d3.forceCenter(WIDTH / 2, HEIGHT / 2))
+      .force("x", d3.forceX(WIDTH / 2).strength(0.035))
+      .force("y", d3.forceY(HEIGHT / 2).strength(0.035))
+      .force(
+        "collide",
+        d3.forceCollide<GraphNode>().radius((node) => 6 + Math.min(node.deg, 12)),
+      );
+
+    const link = linkG
+      .selectAll<SVGLineElement, GraphEdge>("line")
+      .data(visibleEdges, (edge) => `${endpointId(edge.source)}-${endpointId(edge.target)}-${edge.index}`)
+      .join("line")
+      .attr("stroke", (edge) => REL_COLOR[edge.rel])
+      .attr("stroke-width", (edge) => (edge.rel === "DUP" ? 1.1 : 1.8))
+      .attr("stroke-opacity", (edge) => (edge.rel === "DUP" ? 0.24 : 0.6))
+      .style("cursor", "pointer")
+      .on("mouseenter", (_event, edge) => {
+        setHint(
+          `${endpointId(edge.source)} → ${endpointId(edge.target)}: ${REL_LABEL[edge.rel]}, IBD1 ${formatCm(edge.ibd1)} cM, IBD2 ${formatCm(edge.ibd2)} cM`,
+        );
+      })
+      .on("mouseleave", () => setHint("Hover a sample or relationship line. Click to inspect."))
+      .on("click", (_event, edge) => {
+        setSelection({ kind: "edge", edge });
+        setSearch("");
+      });
+
+    const node = nodeG
+      .selectAll<SVGCircleElement, GraphNode>("circle")
+      .data(visibleNodes, (item) => item.id)
+      .join("circle")
+      .attr("r", (item) => 4 + Math.min(item.deg, 11))
+      .attr("fill", (item) => (item.counts.DUP ? REL_COLOR.DUP : "#8F968B"))
+      .attr("stroke", "#101411")
+      .attr("stroke-width", 1.2)
+      .style("cursor", "grab")
+      .call(
+        d3
+          .drag<SVGCircleElement, GraphNode>()
+          .on("start", (event, item) => {
+            if (!event.active) sim.alphaTarget(0.3).restart();
+            item.fx = item.x;
+            item.fy = item.y;
+          })
+          .on("drag", (event, item) => {
+            item.fx = event.x;
+            item.fy = event.y;
+          })
+          .on("end", (event, item) => {
+            if (!event.active) sim.alphaTarget(0);
+            item.fx = null;
+            item.fy = null;
+          }),
+      )
+      .on("mouseenter", (_event, item) => {
+        setHint(`${item.id}: ${item.deg} relationship(s), component of ${item.componentSize} sample(s).`);
+      })
+      .on("mouseleave", () => setHint("Hover a sample or relationship line. Click to inspect."))
+      .on("click", (_event, item) => {
+        setSelection({ kind: "sample", node: item });
+        setSearch(item.id);
+      });
+
+    const label = labelG
+      .selectAll<SVGTextElement, GraphNode>("text")
+      .data(visibleNodes, (item) => item.id)
+      .join("text")
+      .attr("font-family", "'IBM Plex Mono', monospace")
+      .attr("font-size", 10)
+      .attr("fill", "#F3F0E7")
+      .attr("paint-order", "stroke")
+      .attr("stroke", "#101411")
+      .attr("stroke-width", 3)
+      .attr("opacity", 0)
+      .text((item) => item.id);
+
+    sim.on("tick", () => {
+      link
+        .attr("x1", (edge) => (edge.source as GraphNode).x ?? 0)
+        .attr("y1", (edge) => (edge.source as GraphNode).y ?? 0)
+        .attr("x2", (edge) => (edge.target as GraphNode).x ?? 0)
+        .attr("y2", (edge) => (edge.target as GraphNode).y ?? 0);
+      node.attr("cx", (item) => item.x ?? 0).attr("cy", (item) => item.y ?? 0);
+      label.attr("x", (item) => (item.x ?? 0) + 10).attr("y", (item) => (item.y ?? 0) + 3);
+    });
+
+    (svgEl as SVGSVGElement & { __graph?: { link: typeof link; node: typeof node; label: typeof label; visibleEdges: GraphEdge[] } }).__graph = {
+      link,
+      node,
+      label,
+      visibleEdges,
+    };
+
+    return () => {
+      sim.stop();
+      svg.on(".zoom", null);
+    };
+  }, [data, activeRels]);
+
+  useEffect(() => {
+    const svgEl = svgRef.current as
+      | (SVGSVGElement & {
+          __graph?: {
+            link: d3.Selection<SVGLineElement, GraphEdge, SVGGElement, unknown>;
+            node: d3.Selection<SVGCircleElement, GraphNode, SVGGElement, unknown>;
+            label: d3.Selection<SVGTextElement, GraphNode, SVGGElement, unknown>;
+            visibleEdges: GraphEdge[];
+          };
+        })
+      | null;
+    const graph = svgEl?.__graph;
+    if (!graph) return;
+
+    const neighborIds = selectedId
+      ? new Set(
+          graph.visibleEdges.flatMap((edge) => {
+            const source = endpointId(edge.source);
+            const target = endpointId(edge.target);
+            if (source === selectedId) return [target];
+            if (target === selectedId) return [source];
+            return [];
+          }),
+        )
+      : new Set<string>();
+
+    const selectedPairKey = selectedEdge
+      ? `${endpointId(selectedEdge.source)}-${endpointId(selectedEdge.target)}-${selectedEdge.index}`
+      : null;
+
+    graph.link
+      .attr("stroke-opacity", (edge) => {
+        const key = `${endpointId(edge.source)}-${endpointId(edge.target)}-${edge.index}`;
+        if (selectedPairKey) return key === selectedPairKey ? 0.9 : 0.12;
+        if (!selectedId) return edge.rel === "DUP" ? 0.24 : 0.6;
+        return endpointId(edge.source) === selectedId || endpointId(edge.target) === selectedId ? 0.9 : 0.1;
+      })
+      .attr("stroke-width", (edge) => {
+        const key = `${endpointId(edge.source)}-${endpointId(edge.target)}-${edge.index}`;
+        if (selectedPairKey && key === selectedPairKey) return 3;
+        if (selectedId && (endpointId(edge.source) === selectedId || endpointId(edge.target) === selectedId)) return 2.6;
+        return edge.rel === "DUP" ? 1.1 : 1.8;
+      });
+
+    graph.node
+      .attr("stroke", (item) => (item.id === selectedId ? "#F3F0E7" : "#101411"))
+      .attr("stroke-width", (item) => (item.id === selectedId ? 2.4 : 1.2))
+      .attr("opacity", (item) => {
+        if (!selectedId && !selectedPairKey) return 1;
+        if (selectedId) return item.id === selectedId || neighborIds.has(item.id) ? 1 : 0.25;
+        if (!selectedEdge) return 0.25;
+        return endpointId(selectedEdge.source) === item.id || endpointId(selectedEdge.target) === item.id ? 1 : 0.25;
+      });
+
+    graph.label.attr("opacity", (item) => (item.id === selectedId || neighborIds.has(item.id) ? 1 : 0));
+  }, [selectedId, selectedEdge]);
+
+  const toggleRel = (rel: Rel) => {
+    setActiveRels((prev) => {
+      const next = new Set(prev);
+      if (next.has(rel)) next.delete(rel);
+      else next.add(rel);
+      return next;
+    });
+    setSelection({ kind: "intro" });
+  };
+
+  const selectSample = (id: string) => {
+    const node = data.nodes.find((item) => item.id === id);
+    if (!node) return;
+    setSelection({ kind: "sample", node });
+    setSearch(id);
+  };
+
+  const resetView = () => {
+    setSelection({ kind: "intro" });
+    setSearch("");
+    if (svgRef.current && zoomRef.current) {
+      d3.select(svgRef.current).transition().duration(450).call(zoomRef.current.transform, d3.zoomIdentity);
+    }
+  };
 
   return (
-    <div className="graph-panel">
-      <div className="graph-toolbar">
-        <div className="graph-legend">
-          {(Object.keys(REL_COLORS) as Rel[]).map((rel) => (
-            <span key={rel}>
-              <i style={{ background: REL_COLORS[rel] }} />
-              {rel === "DUP" ? "Dup/MZ-like" : rel}
-            </span>
-          ))}
+    <div className="site-graph">
+      <div className="site-graph-tools">
+        <div>
+          <label htmlFor="sample-search">Find a sample ID</label>
+          <input
+            id="sample-search"
+            list="sample-options"
+            value={search}
+            placeholder="Example: 315_1007"
+            onChange={(event) => {
+              const value = event.target.value.trim();
+              setSearch(event.target.value);
+              if (data.nodes.some((node) => node.id === value)) selectSample(value);
+            }}
+          />
+          <datalist id="sample-options">
+            {data.nodes.map((node) => (
+              <option key={node.id} value={node.id} />
+            ))}
+          </datalist>
         </div>
-        <div className="graph-filters">
-          {(
-            [
-              ["all", "All"],
-              ["ordinary", "Ordinary relatives"],
-              ["dup", "16-sample cluster"],
-            ] as const
-          ).map(([value, label]) => (
-            <button
-              key={value}
-              type="button"
-              className={focus === value ? "is-active" : undefined}
-              onClick={() => setFocus(value)}
-            >
-              {label}
-            </button>
-          ))}
+        <button type="button" onClick={resetView}>
+          Reset view
+        </button>
+      </div>
+
+      <div className="legend">
+        {(Object.keys(REL_COLOR) as Rel[]).map((rel) => (
+          <button
+            key={rel}
+            type="button"
+            className={`chip${activeRels.has(rel) ? "" : " is-dim"}`}
+            onClick={() => toggleRel(rel)}
+          >
+            <span className="dot" style={{ background: REL_COLOR[rel] }} />
+            {REL_LABEL[rel]}
+            <em>{counts[rel]}</em>
+          </button>
+        ))}
+      </div>
+
+      <div className="graph-frame">
+        <svg ref={svgRef} width="100%" height={HEIGHT} role="img" aria-label="SacMEGA relatedness force graph" />
+      </div>
+
+      <p className="graph-hint">{hint}</p>
+      <p className="status-line">{status}</p>
+
+      <div className="graph-summary">
+        <div className="mini">
+          <div className="n">{formatInt(data.nodes.length)}</div>
+          <div className="l">samples in map</div>
+        </div>
+        <div className="mini">
+          <div className="n">{formatInt(data.edges.length)}</div>
+          <div className="l">close-relative pairs</div>
+        </div>
+        <div className="mini">
+          <div className="n">{formatInt(counts.DUP)}</div>
+          <div className="l">duplicate-like flags</div>
+        </div>
+        <div className="mini">
+          <div className="n">{formatInt(DUP_IBD2_THRESHOLD)}</div>
+          <div className="l">IBD2 Dup threshold</div>
         </div>
       </div>
 
-      <svg className="relationship-graph" viewBox="0 0 1040 420" role="img" aria-label="Close relative network graph">
-        <rect x="20" y="20" width="560" height="380" rx="18" className="graph-panel-bg" />
-        <text x="40" y="48" className="graph-caption">
-          Illustrative close-relative families
-        </text>
-        <rect x="620" y="20" width="400" height="380" rx="18" className="graph-panel-bg dup-panel" />
-        <text x="640" y="48" className="graph-caption">
-          Dup/MZ-like component · {STATS.dupClusterSize} samples · {STATS.fsDupCluster} FS pairs
-        </text>
+      <div className="inspector">
+        {selection.kind === "intro" && (
+          <>
+            <h3>Map inspector</h3>
+            <p>
+              Same SacMEGA force graph as sacmega-site: every node is a sample, every edge is a PONDEROSA close-relative
+              call. Red nodes sit in at least one duplicate/MZ-like edge (FS with IBD2 &gt; 3500 cM).
+            </p>
+            <div className="detail-grid">
+              <div>
+                <span>DUP rule</span>
+                <strong>FS + IBD2 &gt; 3500 cM</strong>
+              </div>
+              <div>
+                <span>Node size</span>
+                <strong>number of called relatives</strong>
+              </div>
+              <div>
+                <span>Interaction</span>
+                <strong>drag · zoom · click inspect</strong>
+              </div>
+            </div>
+          </>
+        )}
 
-        {visibleEdges.map((edge) => {
-          const a = nodeMap.get(edge.source);
-          const b = nodeMap.get(edge.target);
-          if (!a || !b) return null;
-          return (
-            <line
-              key={`${edge.source}-${edge.target}-${edge.rel}`}
-              x1={a.x}
-              y1={a.y}
-              x2={b.x}
-              y2={b.y}
-              stroke={REL_COLORS[edge.rel]}
-              strokeWidth={edge.rel === "DUP" ? 1.2 : 2.2}
-              opacity={edge.rel === "DUP" ? 0.35 : 0.85}
-            />
-          );
-        })}
+        {selection.kind === "sample" && (
+          <>
+            <h3>{selection.node.id}</h3>
+            <p>
+              {selection.node.deg} called relationship(s) in component {selection.node.component}, which contains{" "}
+              {selection.node.componentSize} sample(s).
+            </p>
+            <div className="detail-grid">
+              {(Object.keys(REL_COLOR) as Rel[]).map((rel) => (
+                <div key={rel}>
+                  <span>{REL_LABEL[rel]}</span>
+                  <strong>{selection.node.counts[rel] || 0}</strong>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
 
-        {visibleNodes.map((node) => (
-          <g key={node.id} transform={`translate(${node.x}, ${node.y})`}>
-            <circle
-              r={node.group === "dup" ? 11 : 13}
-              className={node.group === "dup" ? "node-dup" : "node-ordinary"}
-            />
-            <title>{node.id}</title>
-          </g>
-        ))}
-      </svg>
-
-      <p className="graph-note">
-        Left: schematic families for PO / FS / AV / MHS patterns. Right: the real SacMEGA 16-sample
-        duplicate-like component from the report (every pair called FS; IBD pattern is Dup/MZ-like).
-        Edge subset drawn for readability; full clique size is {STATS.fsDupCluster}.
-      </p>
+        {selection.kind === "edge" && (
+          <>
+            <h3>
+              {endpointId(selection.edge.source)} → {endpointId(selection.edge.target)}
+            </h3>
+            <p>
+              Map label {REL_LABEL[selection.edge.rel]} · PONDEROSA pred_rel {selection.edge.predRel}
+            </p>
+            <div className="detail-grid">
+              <div>
+                <span>Probability</span>
+                <strong>{formatProb(selection.edge.prob)}</strong>
+              </div>
+              <div>
+                <span>IBD1</span>
+                <strong>{formatCm(selection.edge.ibd1)} cM</strong>
+              </div>
+              <div>
+                <span>IBD2</span>
+                <strong>{formatCm(selection.edge.ibd2)} cM</strong>
+              </div>
+              <div>
+                <span>Segments</span>
+                <strong>{formatInt(selection.edge.segments)}</strong>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
